@@ -1,6 +1,7 @@
+````markdown
 # Multi-Agent QA System: Command-Line Manual
 
-This tool allows you to run multi-agent reasoning pipelines over datasets such as MathQA or PubMedQA using static (hierarchical) or dynamic (supervisor) agent orchestration.
+This tool allows you to run multi-agent reasoning pipelines over datasets such as **MathQA**, **PubMedQA**, **GPQA**, or **HumanEval** using static (hierarchical) or dynamic (supervisor) agent orchestration.
 
 ---
 
@@ -11,128 +12,182 @@ Make sure your directory includes:
 - `architecture.py`
 - `subagents.py`
 - `utils.py`
+- `logger.py` *(lowercase name to match imports)*
 - `evaluate.py`
-- Your model backend (e.g. TextGen WebUI or Ollama running)
+- Your model backend running (e.g., **TextGen WebUI** or **Ollama**)
 
 ---
 
 ## 🚀 Basic Usage
 
-### Run Hierarchical Pipeline (MathQA-style) you can also chooes subagents for hierarchical just make sure the last is answering
-  ["problem_understanding", "mathematical_formulation", "computation", "answering"],
+### Run Hierarchical Pipeline (MathQA-style)  
+You can choose any subset of subagents for hierarchical mode — just make sure the last one is `answering`.
+
+**Default MathQA agents:**
+```python
+["problem_understanding", "mathematical_formulation", "computation", "answering"]
+````
+
+**Example:**
+
 ```bash
 python main.py --hierarchical --csv mathqa.csv --data mathqa
 ```
- ### Choices to use as subagents for MATHQA
-  ["problem_understanding", "mathematical_formulation", "computation", "answering"], use as many or as little as you want for mathqa, also make sure the last is answering
-
-```bash
-python main.py --supervisor --csv mathqa.csv --data mathqa --structure problem_understanding,mathematical_formulation,computation,anwering
-```
-
-
-### Run Supervisor Pipeline (PubMedQA-style) use as many or as little as you want for pubmedqa from the list  [question_understanding,context_analysis,reasoning,answering]
-
-```bash
-python main.py --supervisor --csv pubmedqa.csv --data pubmedqa --structure question_understanding,context_analysis,reasoning,answering
-```
-## Run any kind for GPQA. use as many or as little as you want for gpqa from the list [question_understanding,knowledge_grounding,option_elimination,answering] we use the same data mode as mathqa
-
-```bash
-python main.py --supervisor --csv gpqa.csv --data mathqa --structure question_understanding,knowledge_grounding,option_elimination,answering
-```
-
-## if you want to log your result, please add --log_path output.csv
-if you want to test run, try this
-```bash
-python main.py --hierarchical --csv mathqa_tets_5.csv --data mathqa --log_path output.csv
-```
-
-then you will get the outoput of the first five mathqa decisions in output.csv
 
 ---
 
+### Run Supervisor Pipeline (MathQA-style)
+
+Use as many or as few subagents as you want, but make sure `answering` is last.
+
+```bash
+python main.py --supervisor --csv mathqa.csv --data mathqa \
+  --structure problem_understanding,mathematical_formulation,computation,answering
+```
+
+---
+
+### Run Supervisor Pipeline (PubMedQA-style)
+
+Choose from:
+
+```python
+[question_understanding, context_analysis, reasoning, answering]
+```
+
+**Example:**
+
+```bash
+python main.py --supervisor --csv pubmedqa.csv --data pubmedqa \
+  --structure question_understanding,context_analysis,reasoning,answering
+```
+
+---
+
+### Run Pipeline for GPQA
+
+We use the same data mode as MathQA, but agent options can be:
+
+```python
+[question_understanding, knowledge_grounding, option_elimination, answering]
+```
+
+**Example:**
+
+```bash
+python main.py --supervisor --csv gpqa.csv --data mathqa \
+  --structure question_understanding,knowledge_grounding,option_elimination,answering
+```
+
+---
+
+### Run HumanEval (Code Generation)
+
+```bash
+python main.py --hierarchical --data human_eval \
+  --jsonl_path HumanEval.jsonl \
+  --log_path samples_output.jsonl
+```
+
+Then run the official evaluation:
+
+```bash
+evaluate_functional_correctness samples_output.jsonl
+```
+
+---
+
+### Logging
+
+Add `--log_path` to save step-by-step outputs.
+Example for a quick test:
+
+```bash
+python main.py --hierarchical --csv mathqa_test_5.csv --data mathqa --log_path output.csv
+```
+
+You will get the outputs of the first 5 MathQA questions in `output.csv`.
+
+---
 
 ## 🧠 Key Arguments
-
 
 | Argument         | Type   | Description                                           |
 | ---------------- | ------ | ----------------------------------------------------- |
 | `--hierarchical` | flag   | Use static agent order                                |
-| `--supervisor`   | flag   | Use dynamic/supervisor decisions                      |
+| `--supervisor`   | flag   | Use dynamic agent decisions                           |
 | `--csv`          | string | Path to input CSV file                                |
 | `--jsonl_path`   | string | Path to HumanEval JSONL file                          |
 | `--data`         | string | One of: `mathqa`, `pubmedqa`, `human_eval`, or `auto` |
-| `--structure`    | string | Comma-separated agent names                           |
+| `--structure`    | string | Comma-separated list of agent names                   |
 | `--max_steps`    | int    | (Supervisor only) Max decision steps (default: 5)     |
 | `--log_path`     | string | Path to save conversation trace (CSV/JSONL)           |
 | `--verbose`      | flag   | Show detailed outputs                                 |
 
 ---
 
-## 📦 Example Inputs
+## 📦 Example Input Formats
 
-### MathQA CSV Format
+**MathQA CSV:**
+
 ```csv
 problem,options
-"If a car travels 60 miles...", "A. 30 B. 40 C. 50 D. 60 E. 70"
+"If a car travels 60 miles in 1.5 hours...", "A. 30 mph B. 40 mph C. 50 mph D. 60 mph E. 70 mph"
 ```
 
-### PubMedQA CSV Format
+**PubMedQA CSV:**
+
 ```csv
-context,question,options
-"The disease is caused by...", "Is it treatable?", "A. Yes B. No C. Maybe"
+context,question
+"The disease is caused by...", "Is it treatable?"
 ```
 
+**GPQA CSV:**
+(same as MathQA)
 
-### GPQA CSV Format
 ```csv
 problem,options
 "Which planet is the largest?", "A. Earth B. Mars C. Jupiter D. Venus"
 ```
 
+**HumanEval JSONL:**
+
+```json
+{"task_id": "HumanEval/0", "prompt": "def add(a, b):\n    \"\"\"Add two numbers and return the sum.\"\"\"\n", "code_context": ""}
+{"task_id": "HumanEval/1", "prompt": "def is_even(n):\n    \"\"\"Return True if n is even, otherwise False.\"\"\"\n", "code_context": ""}
+```
+
+* Each line is a JSON object.
+* `task_id`: unique identifier for the problem.
+* `prompt`: function signature and docstring.
+* `code_context` (optional): partial code context to complete.
+
 ---
 
 ## 📝 Output Files
 
-- `log_path` logs full transcript of each agent call per step.
+* **CSV logging** (MathQA, PubMedQA, GPQA): Contains step-by-step agent outputs.
+* **JSONL output** (HumanEval): Each line contains `{"task_id": "...", "completion": "..."}`.
 
 ---
 
-## 🧪 Advanced
+## 🧪 Evaluation
 
-- You can pass any subset of agents to `--structure` for custom flows.
-- Add your own agent to `subagents.py` and register it in `AGENT_FUNCTIONS`.
+### 1. Evaluating QA Tasks (MathQA, PubMedQA, GPQA)
 
----
-
-## 🔧 Notes
-
-- Backend must be running before calling `main.py`
-- For TextGenWebUI, provide the correct port during CLI prompt
-- For Ollama, ensure your model is downloaded
-
----
-## NOW that you have produced a file output, you need to evaluate and print out the accuracy
-
-### 🧪 Evaluation
-
-After generating an output file, you can calculate its accuracy.
-## 1. Evaluating QA Tasks (MathQA, PubMedQA, GPQA)
-
+After generating predictions, run:
 
 ```bash
-python evaluate.py --pred pubmedqa_output.csv --label pubmedqa.csv --task pubmedqa
+python evaluate.py --pred pubmedqa_output.csv --label pubmedqa_labels.csv --task pubmedqa
 ```
 
-Supported task types:
-- `mathqa`: uses the `Correct Answer` column
-- `gpqa`: uses the `correct_answer` column
-- `pubmedqa`: uses the `final decision` column
+**Supported tasks:**
 
----
+* `mathqa` → uses `Correct Answer` column
+* `gpqa` → uses `correct_answer` column
+* `pubmedqa` → uses `final decision` column
 
-### Output
+**Example output:**
 
 ```bash
 ✅ Task: pubmedqa
@@ -141,23 +196,85 @@ Correct answers: 421
 Accuracy: 84.20%
 ```
 
-The evaluator uses a robust parsing function to extract and normalize answers from model output, ensuring accurate scoring even with format noise.
+---
+
+### 2. Evaluating HumanEval
+
+#### 📥 Download HumanEval Dataset
+
+```bash
+# Clone the HumanEval repository (only needed once)
+git clone https://github.com/openai/human-eval.git
+
+# Move into the folder
+cd human-eval
+
+# (Optional) Create a Python virtual environment for evaluation
+python -m venv venv
+source venv/bin/activate   # Linux/Mac
+# venv\Scripts\activate    # Windows
+
+# Install requirements for HumanEval
+pip install -e .
+```
+
+The dataset file is located at:
+
+```
+human-eval/data/HumanEval.jsonl.gz
+```
 
 ---
 
-## 2. Evaluating HumanEval
+#### 🧪 Running HumanEval with This Project
 
-Use the official human-eval library script. Do not use evaluate.py.
+1. **Unzip the dataset into your project folder:**
+
+```bash
+gunzip human-eval/data/HumanEval.jsonl.gz -c > HumanEval.jsonl
+```
+
+2. **Run your pipeline in `human_eval` mode:**
+
+```bash
+python main.py --hierarchical \
+  --data human_eval \
+  --jsonl_path HumanEval.jsonl \
+  --log_path samples_output.jsonl
+```
+
+* You can replace `--hierarchical` with `--supervisor` if testing supervisor mode.
+* If `--structure` is not given, defaults to `["code_generation"]` for HumanEval.
+
+3. **Evaluate using the official script:**
 
 ```bash
 evaluate_functional_correctness samples_output.jsonl
 ```
 
-Example Output (Pass@k scores):
+---
+
+#### 📊 Example Pass\@k Output
 
 ```
 Calculating pass@k...
 pass@1: 0.1585
 pass@10: 0.2317
 pass@100: 0.3475
+```
+
+---
+
+## 🔧 Notes
+
+* Backend must be running before calling `main.py`.
+* For **TextGen WebUI**, provide the correct port when prompted.
+* For **Ollama**, ensure the model is downloaded.
+* Keep filenames lowercase to match imports (`logger.py`, `utils.py`).
+* For HumanEval, use `["code_generation"]` as the structure to avoid mixing reasoning into code.
+* You can add new agents in `subagents.py` and register them in `AGENT_FUNCTIONS`.
+
+---
+
+```
 ```
