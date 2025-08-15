@@ -1,4 +1,4 @@
-````markdown
+
 # Multi-Agent QA System: Command-Line Manual
 
 This tool allows you to run multi-agent reasoning pipelines over datasets such as **MathQA**, **PubMedQA**, **GPQA**, or **HumanEval** using static (hierarchical) or dynamic (supervisor) agent orchestration.
@@ -12,7 +12,7 @@ Make sure your directory includes:
 - `architecture.py`
 - `subagents.py`
 - `utils.py`
-- `logger.py` *(lowercase name to match imports)*
+- `logger.py`
 - `evaluate.py`
 - Your model backend running (e.g., **TextGen WebUI** or **Ollama**)
 
