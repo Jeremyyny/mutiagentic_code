@@ -1,12 +1,3 @@
-
-# =============================
-# main_grpo.py (改进版)
-# 变化点：
-# 1) 新增 freeze_manager_backbone、use_value_baseline、lambda/value 系数、manager_token_max_len
-# 2) specialist_max_tokens 默认 150
-# 3) 仅训练 heads 的说明
-# =============================
-
 import torch
 import json
 import random
@@ -22,10 +13,10 @@ def load_dataset_from_json(path):
         with open(path, 'r', encoding='utf-8') as f:
             full_data = json.load(f)
     except FileNotFoundError:
-        print(f"错误: 文件 '{path}' 未找到。")
+        print(f"Wrong: File '{path}' could not be found.")
         return []
     except json.JSONDecodeError:
-        print(f"错误: 文件 '{path}' 不是有效的 JSON 文件。")
+        print(f"Error: File '{path}' is not valid JSON file.")
         return []
 
     dataset = []
@@ -40,52 +31,63 @@ def load_dataset_from_json(path):
 
 def main():
     config = {
-        # === 1. 模型路径 ===
-        "manager_model_path": "Qwen/Qwen2.5-0.5B-Instruct",
-        "specialist_model_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        # === 1. Model Paths ===
+        "manager_model_path": "Qwen/Qwen2.5-7B-Instruct",  # Changed to 7B
+        "specialist_model_path": "Qwen/Qwen2.5-7B-Instruct",  # Changed to 7B
         
-        # === 2. 数据路径 ===
-        "dataset_path": r"C:\\Users\\yyn07\\Desktop\\multi_agent_test\\Codes\\data\\golden_dataset_pubmedqa_qwen2.5_pro_test_500.json",
+        # === 2. Data Path ===
+        "dataset_path": r"C:\Users\yyn07\Desktop\multi_agent_test\Codes\data\golden_dataset_pubmedqa_qwen2.5_pro_test_500.json",
 
-        # === 3. 训练超参数 ===
-        "num_epochs": 3,
+        # === 3. Training Hyperparameters ===
+        "num_epochs": 5,  # Increased for 7B
         "max_steps": 5,
-        "manager_lr": 5e-6,  # 更稳健（只训 heads）
-        "specialist_max_tokens": 150,
+        "manager_lr": 3e-6,  # Lower LR for larger model
+        "specialist_max_tokens": 300,  # Increased for richer responses
         
-        # === 4. GRPO 参数 ===
+        # === 4. GRPO Parameters ===
         "num_samples_per_prompt": 4,
         "grpo_epochs": 3,
-        "minibatch_size": 8,
+        "minibatch_size": 4,  # Reduced for 7B memory
         "ent_coef": 0.01,
         "max_grad_norm": 1.0,
         
-        # === 5. 输出控制 ===
+        # === 5. Output Control ===
         "verbose_trajectory": True,
-        "verbose_frequency": 5,
+        "verbose_frequency": 10,  # Log less frequently
         
-        # === 6. 混合精度 ===
+        # === 6. Mixed Precision ===
         "use_amp": True,
         
-        # === 7. 奖励维度和偏好 ===
+        # === 7. Reward Dimensions and Preferences ===
         "reward_dims": ["correctness", "efficiency", "quality"],
-        "manager_preference": [1.0, 0.1, 0.2],
+        "manager_preference": [1.0, 0.2, 0.3],  # Increased quality weight
         
-        # === 8. 数据划分 ===
+        # === 8. Data Split ===
         "random_seed": 42,
         "train_ratio": 0.8,
         
-        # === 9. Manager 训练范围与 Baseline ===
-        "freeze_manager_backbone": True,      # 仅训练 heads
-        "use_value_baseline": True,           # 启用 GRPO-λ 和 value loss
-        "lambda_coef": 0.5,                   # GRPO-λ 中 V 的权重
-        "value_coef": 0.5,                    # value loss 权重
-        "normalize_adv": False,               # 是否标准化组优势
-        "manager_token_max_len": 1024,
+        # === 9. Manager Training Scope ===
+        "freeze_manager_backbone": True,
+        "use_value_baseline": True,
+        "lambda_coef": 0.5,
+        "value_coef": 0.5,
+        "normalize_adv": False,
+        "manager_token_max_len": 2048,  # Increased for 7B
+        
+        # === 10. WandB Configuration ===
+        "use_wandb": True,
+        "wandb_project": "multi-agent-pubmedqa-7b",
+        "wandb_run_name": "grpo-qwen2.5-7b-improved-prompts",
+        "wandb_tags": ["grpo", "7b", "pubmedqa", "improved-prompts"],
+        "wandb_notes": "7B model with enhanced prompts and better history utilization"
     }
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     print("="*60)
     print("LOADING AND SPLITTING DATASET")
@@ -94,7 +96,7 @@ def main():
     full_dataset = load_dataset_from_json(config['dataset_path'])
     
     if not full_dataset:
-        print("错误: 数据集为空!")
+        print("Error: The dataset is empty")
         return
     
     print(f"✓ Loaded {len(full_dataset)} samples")
@@ -114,7 +116,7 @@ def main():
     print(f"  Test set:       {len(test_dataset)} samples")
     print("="*60)
     
-    test_indices_file = "./test_indices_grpo.json"
+    test_indices_file = "./test_indices_grpo_7b.json"
     with open(test_indices_file, 'w', encoding='utf-8') as f:
         json.dump({
             "random_seed": config['random_seed'],
@@ -125,7 +127,7 @@ def main():
         }, f, indent=2, ensure_ascii=False)
     print(f"✓ Saved test set info to {test_indices_file}\n")
 
-    print("Initializing model backend...")
+    print("Initializing model backend for 7B...")
     specialist_backend = LocalHF(
         config['specialist_model_path'], 
         max_tokens=config['specialist_max_tokens']
@@ -133,7 +135,7 @@ def main():
     specialist_backend.model.eval()
     for param in specialist_backend.model.parameters():
         param.requires_grad = False
-    print("✓ Specialist model frozen (no training)")
+    print("✓ Specialist model (7B) frozen")
 
     print("\nInitializing Manager and Specialists...")
     specialist_names = ["problem_understanding", "reasoning", "computation", "answering"]
@@ -147,13 +149,15 @@ def main():
     )
     
     print("="*60)
-    print("Manager Configuration")
+    print("Manager Configuration (7B)")
     print("="*60)
+    print(f"Model: {config['manager_model_path']}")
     print(f"Specialists: {specialist_names}")
     print(f"Reward dims: {config['reward_dims']}")
     print(f"Preference:  {config['manager_preference']}")
     print(f"Freeze backbone: {config['freeze_manager_backbone']}")
-    print(f"Use value baseline: {config['use_value_baseline']} (lambda={config['lambda_coef']}, value_coef={config['value_coef']})")
+    print(f"Value baseline: {config['use_value_baseline']} (λ={config['lambda_coef']}, value_coef={config['value_coef']})")
+    print(f"Token max length: {config['manager_token_max_len']}")
     print("="*60)
     
     print("\nTesting Manager...")
@@ -162,19 +166,24 @@ def main():
         test_action, _, _, _ = manager.act(test_state, [])
         print(f"✓ Manager selected: {test_action['specialist_id']}")
     
+    # Import improved subagents prompts
+    print("\nLoading improved subagent prompts (7B-optimized)...")
+    import subagents as subagents
+    
     specialists = {
         name: FixedSpecialistAgent(agent_name=name, model_backend=specialist_backend)
         for name in specialist_names
     }
-    print(f"✓ Created {len(specialists)} fixed specialists")
+    print(f"✓ Created {len(specialists)} specialists with improved prompts")
 
-    print("\nInitializing GRPO Trainer...")
+    print("\nInitializing GRPO Trainer with WandB...")
     trainer = GRPOTrainer(
         config=config,
         manager=manager,
         specialists=specialists,
         model_backend=specialist_backend,
-        train_dataset=train_dataset
+        train_dataset=train_dataset,
+        use_wandb=config['use_wandb']
     )
     
     print("="*60)
@@ -184,26 +193,29 @@ def main():
     print(f"GRPO epochs:         {config['grpo_epochs']}")
     print(f"Manager LR:          {config['manager_lr']}")
     print(f"Minibatch size:      {config['minibatch_size']}")
+    print(f"WandB enabled:       {config['use_wandb']}")
+    if config['use_wandb']:
+        print(f"WandB project:       {config['wandb_project']}")
+        print(f"WandB run:           {config['wandb_run_name']}")
     print("="*60)
 
-    print("\n🚀 Starting GRPO Training...")
-    print("💡 Note: Only Manager HEADS are being trained (backbone frozen)\n")
+    print("\n🚀 Starting GRPO Training (7B model)...")
+    print("💡 Note: Only Manager HEADS are being trained (backbone frozen)")
+    print("📊 Training metrics will be logged to WandB\n")
     
     trainer.train()
     
-    print("\n💾 Saving trained Manager...")
-    trainer.save_manager("./trained_manager_grpo")
-    print("✓ Training completed!")
+    print("\n💾 Final save completed!")
     
     print("\n" + "="*60)
-    print("NEXT STEPS")
+    print("TRAINING COMPLETED")
     print("="*60)
     print(f"✓ Manager saved to: ./trained_manager_grpo")
-    print(f"✓ Test set info saved to: {test_indices_file}")
-    print(f"\nTo evaluate:")
-    print(f"  1. Load the trained Manager")
-    print(f"  2. Use the test set (last {len(test_dataset)} samples)")
-    print(f"  3. Run inference with fixed Specialists")
+    print(f"✓ Best model saved to: ./checkpoints_grpo/best_model")
+    print(f"✓ Test set info: {test_indices_file}")
+    if config['use_wandb']:
+        print(f"✓ View training metrics at: https://wandb.ai")
+    print("\nNext: Run evaluate_manager_inference.py to test the trained model")
     print("="*60)
 
 
