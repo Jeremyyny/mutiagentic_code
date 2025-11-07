@@ -14,28 +14,43 @@ class GRPOTrainer:
     def __init__(self, config, manager, specialists, model_backend, train_dataset, accelerator=None):
         self.config = config
         self.accelerator = accelerator
+        # 不再依赖 self.device 来迁移模型；仅作为张量默认设备的备选
         self.device = accelerator.device if accelerator else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.manager = manager.to(self.device)
+        # 不要把整个 manager 包到 DDP；也不要手动 .to()
+        self.manager = manager
         self.specialists = specialists
         self.model_backend = model_backend
-        self.model_backend.model.to(self.device)
         self.train_dataset = train_dataset
 
-        # Optimize only heads
+        # 仅优化 heads
         head_params = list(self.manager.policy_head.parameters()) + list(self.manager.value_head.parameters())
         self.manager_optimizer = Adam(head_params, lr=config['manager_lr'])
 
-        # Prepare for distributed training
+        # 分布式准备：只包装 可训练子模块 + 优化器（保留 manager 自定义方法）
         if self.accelerator:
-            self.manager_optimizer = self.accelerator.prepare(self.manager_optimizer)
+            # 先把底层 nn.Module 子模块交给 accelerate
             if hasattr(self.manager, "model"):
                 self.manager.model = self.accelerator.prepare(self.manager.model)
+            if hasattr(self.manager, "policy_head"):
+                self.manager.policy_head = self.accelerator.prepare(self.manager.policy_head)
+            if hasattr(self.manager, "value_head"):
+                self.manager.value_head = self.accelerator.prepare(self.manager.value_head)
 
-        # GRPO parameters
+            # specialist 的底层模型（推理用）也交给 accelerate，避免设备不一致
+            if hasattr(self.model_backend, "model"):
+                self.model_backend.model = self.accelerator.prepare(self.model_backend.model)
+
+            # 优化器交给 accelerate
+            self.manager_optimizer = self.accelerator.prepare(self.manager_optimizer)
+
+        # GRPO 参数
         self.num_samples_per_prompt = config.get('num_samples_per_prompt', 4)
         self.reward_dims = config['reward_dims']
-        self.manager_preference = torch.tensor(config['manager_preference'], device=self.device, dtype=torch.float32)
+
+        # 偏好向量放 CPU，采样阶段在 CPU 计算点积，避免跨设备
+        self.manager_preference = torch.tensor(config['manager_preference'], dtype=torch.float32)
+
         self.use_value_baseline = config.get('use_value_baseline', True)
         self.lambda_coef = float(config.get('lambda_coef', 0.5))
         self.value_coef = float(config.get('value_coef', 0.5))
@@ -69,7 +84,7 @@ class GRPOTrainer:
             self.wandb = wandb
 
     # ---------------------------- Advantage ----------------------------
-    def _compute_group_advantages(self, group_rewards):
+    def _compute_group_advantages(self, group_rewards: torch.Tensor):
         group_mean = group_rewards.mean()
         advantages = group_rewards - group_mean
         if self.config.get('normalize_adv', False) and advantages.std() > 1e-8:
@@ -86,9 +101,11 @@ class GRPOTrainer:
             history, episode_steps = [], []
             for step in range(self.config['max_steps']):
                 try:
+                    # 这里必须是原始 manager（未被 DDP 代理吞掉自定义方法）
                     manager_action, action_index, action_log_prob, _ = self.manager.act(state, history)
                     if not manager_action or manager_action.get('specialist_id') is None:
                         break
+
                     specialist_id = manager_action["specialist_id"]
                     specialist = self.specialists[specialist_id]
                     current_state = {**state, "instruction": manager_action["input"]}
@@ -111,11 +128,15 @@ class GRPOTrainer:
             if episode_steps:
                 traj = [(s["specialist_id"], history[i]["content"]) for i, s in enumerate(episode_steps)]
                 reward_vec_dict = reward.get_reward_vector(traj, ground_truth, self.config['max_steps'])
-                reward_vec = torch.tensor([reward_vec_dict[dim] for dim in self.reward_dims], device=self.device)
-                scalar_reward = torch.dot(reward_vec, self.manager_preference).item()
+
+                # 在 CPU 计算 reward 向量的加权和，避免 GPU/进程间 device 不一致
+                reward_vec_cpu = torch.tensor([reward_vec_dict[dim] for dim in self.reward_dims], dtype=torch.float32)
+                pref_cpu = self.manager_preference.to(torch.float32)
+                scalar_reward = float(torch.dot(reward_vec_cpu, pref_cpu).item())
+
                 group_trajectories.append({
                     "steps": episode_steps,
-                    "scalar_reward": float(scalar_reward),
+                    "scalar_reward": scalar_reward,
                 })
         return group_trajectories
 
@@ -123,8 +144,16 @@ class GRPOTrainer:
     def update_manager_grpo(self, group_trajectories, global_step):
         if not group_trajectories:
             return {}
-        group_rewards = torch.tensor([t['scalar_reward'] for t in group_trajectories], device=self.device)
+
+        # 统一使用“manager 可训练参数”的设备作为本轮计算设备
+        model_device = next(self.manager.policy_head.parameters()).device
+
+        group_rewards = torch.tensor(
+            [t['scalar_reward'] for t in group_trajectories],
+            dtype=torch.float32, device=model_device
+        )
         group_adv = self._compute_group_advantages(group_rewards)
+
         all_steps = []
         for traj_idx, traj in enumerate(group_trajectories):
             for step in traj['steps']:
@@ -144,30 +173,48 @@ class GRPOTrainer:
             indices = np.random.permutation(num_total_steps)
             for start in range(0, num_total_steps, minibatch_size):
                 mb = [all_steps[i] for i in indices[start:start + minibatch_size]]
+
+                # Tokenize 在 CPU，随后移动到 model_device
                 state_prompts = [s['state_prompt'] for s in mb]
                 tokenized = self.manager.tokenizer(
                     state_prompts, return_tensors="pt", padding=True, truncation=True,
                     max_length=self.manager_token_max_len
                 )
-                state_ids = tokenized['input_ids'].to(self.device)
-                state_mask = tokenized['attention_mask'].to(self.device)
-                action_indices = torch.tensor([s['manager_action_index'] for s in mb], dtype=torch.long, device=self.device)
-                scalar_rewards = torch.tensor([s['scalar_reward'] for s in mb], dtype=torch.float32, device=self.device)
-                group_advs = torch.tensor([s['group_advantage'] for s in mb], dtype=torch.float32, device=self.device)
+                state_ids = tokenized['input_ids'].to(model_device, non_blocking=True)
+                state_mask = tokenized['attention_mask'].to(model_device, non_blocking=True)
 
+                action_indices = torch.tensor(
+                    [s['manager_action_index'] for s in mb],
+                    dtype=torch.long, device=model_device
+                )
+                scalar_rewards = torch.tensor(
+                    [s['scalar_reward'] for s in mb],
+                    dtype=torch.float32, device=model_device
+                )
+                group_advs = torch.tensor(
+                    [s['group_advantage'] for s in mb],
+                    dtype=torch.float32, device=model_device
+                )
+
+                # 前向：在与参数一致的 device 上
                 new_log_probs, new_values, entropy = self.manager.evaluate_batch(state_ids, state_mask, action_indices)
+
+                # 优势
                 adv = group_advs
                 if self.use_value_baseline:
                     adv_v = (scalar_rewards - new_values.detach())
                     adv = (1 - self.lambda_coef) * adv + self.lambda_coef * adv_v
+
                 policy_loss = -(new_log_probs * adv).mean()
-                value_loss = torch.tensor(0.0, device=self.device)
+                value_loss = torch.tensor(0.0, device=model_device)
                 if self.use_value_baseline and self.value_coef > 0.0:
                     value_loss = F.mse_loss(new_values, scalar_rewards)
+
                 ent_coef = self.config.get('ent_coef', 0.01)
                 loss = policy_loss + self.value_coef * value_loss - ent_coef * entropy
 
-                self.manager_optimizer.zero_grad()
+                # 反向 + 同步
+                self.manager_optimizer.zero_grad(set_to_none=True)
                 if self.accelerator:
                     self.accelerator.backward(loss)
                     self.accelerator.clip_grad_norm_(
@@ -197,7 +244,6 @@ class GRPOTrainer:
             "entropy": total_entropy / max(1, num_updates),
         }
 
-        # Log to WandB
         if self.wandb:
             self.wandb.log(metrics | {"step": global_step})
 
@@ -234,7 +280,6 @@ class GRPOTrainer:
                             'reward': f"{metrics['avg_reward']:.3f}"
                         })
 
-            # Epoch summary
             if self.accelerator is None or self.accelerator.is_main_process:
                 avg_reward = np.mean(epoch_rewards) if epoch_rewards else 0
                 avg_loss = np.mean(epoch_losses) if epoch_losses else 0

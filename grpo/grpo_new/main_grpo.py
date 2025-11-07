@@ -33,9 +33,9 @@ def load_dataset_from_json(path):
 
 def main():
     # ======================================================
-    # 1️⃣ Initialize Accelerator
+    # 1️⃣ Initialize Accelerator (bf16 for Blackwell)
     # ======================================================
-    accelerator = Accelerator(mixed_precision="bf16")  # ✅ RTX 6000 Blackwell 支持 bf16
+    accelerator = Accelerator(mixed_precision="bf16")
     device = accelerator.device
     if accelerator.is_main_process:
         print(f"Using accelerator device: {device}")
