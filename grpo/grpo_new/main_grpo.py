@@ -70,6 +70,7 @@ def main():
         "manager_token_max_len": 1024,
         "baseline_warmup_steps": 200,
         "log_interval": 5,
+        "verbose_trajectory": True,
         "use_wandb": True,
         "wandb_project": "multi-agent-pubmedqa-7b",
         "wandb_run_name": "grpo-qwen2.5-7b-v2",

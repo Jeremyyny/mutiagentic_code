@@ -108,6 +108,15 @@ class GRPOTrainer:
                     current_state = {**state, "instruction": act["input"]}
                     output_text, _, _ = specialist.generate(current_state, history)
 
+                    # ✅ WandB trajectory logging
+                    if self.wandb and self.config.get("verbose_trajectory", False):
+                        self.wandb.log({
+                            "trajectory/epoch": self.current_epoch if hasattr(self, "current_epoch") else -1,
+                            "trajectory/step": step,
+                            "trajectory/specialist": sid,
+                            "trajectory/manager_logp": float(action_log_prob),
+                            "trajectory/output_snippet": output_text[:100],
+                        })
                     episode_steps.append({
                         "state_prompt": self.manager._build_prompt(state, history),
                         "manager_action_index": int(action_index),
@@ -115,6 +124,13 @@ class GRPOTrainer:
                         "specialist_id": sid,
                     })
                     history.append({"role": "assistant", "content": f"[{sid}]: {output_text}"})
+
+                    if self.wandb and self.config.get("verbose_trajectory", False):
+                        self.wandb.log({
+                        "trajectory/final_specialist": sid,
+                            "trajectory/length": step + 1,
+                            "trajectory/final_answer": output_text[:60],
+    })
                     if sid == "answering" or step == self.config['max_steps'] - 1:
                         break
                 except Exception as e:
@@ -228,7 +244,9 @@ class GRPOTrainer:
     # 训练入口
     # ===============================================================
     def train(self):
-        # === 分布式采样器 ===
+    # ======================================================
+    # 分布式采样器初始化
+    # ======================================================
         if self.accelerator and self.accelerator.state.num_processes > 1:
             sampler = DistributedSampler(self.train_dataset, shuffle=True, drop_last=True)
             dataloader = DataLoader(self.train_dataset, batch_size=1, sampler=sampler,
@@ -237,14 +255,18 @@ class GRPOTrainer:
             dataloader = DataLoader(self.train_dataset, batch_size=1, shuffle=True,
                                     drop_last=True, num_workers=2, pin_memory=True)
 
-        # === accelerate 兼容旧版本 prepare ===
+        # accelerate 兼容旧版本 prepare
         if self.accelerator:
-            if DataLoaderConfiguration is not None:
+            try:
+                from accelerate.data_loader import DataLoaderConfiguration
                 dl_cfg = DataLoaderConfiguration(use_seeded_sampler=False)
                 dataloader = self.accelerator.prepare_data_loader(dataloader, dataloader_config=dl_cfg)
-            else:
+            except ImportError:
                 dataloader = self.accelerator.prepare(dataloader)
 
+        # ======================================================
+        # 主训练循环
+        # ======================================================
         global_step = 0
         for epoch in range(self.config['num_epochs']):
             if not self.accelerator or self.accelerator.is_main_process:
@@ -255,8 +277,29 @@ class GRPOTrainer:
                         disable=not (self.accelerator is None or self.accelerator.is_main_process))
 
             for batch in pbar:
-                sample = {k: batch[k][0] for k in batch}
-                gtraj = self.collect_trajectory_group(sample)
+                # ======================================================
+                # ✅ 仅 rank0 rollout
+                # ======================================================
+                if self.accelerator is None or self.accelerator.is_main_process:
+                    sample = {k: batch[k][0] for k in batch}
+                    gtraj = self.collect_trajectory_group(sample)
+                else:
+                    gtraj = []
+
+                # ======================================================
+                # ✅ 将 trajectory 同步到所有 GPU
+                # ======================================================
+                if self.accelerator and self.accelerator.num_processes > 1:
+                    gathered_traj = self.accelerator.gather_object(gtraj)
+                    # gather_object 会返回所有 rank 的 list，需要合并
+                    gtraj = []
+                    for gt in gathered_traj:
+                        if isinstance(gt, list):
+                            gtraj.extend(gt)
+
+                # ======================================================
+                # ✅ 所有 rank 同步更新参数
+                # ======================================================
                 if not gtraj:
                     continue
                 metrics = self.update_manager_grpo(gtraj, global_step)
@@ -267,17 +310,30 @@ class GRPOTrainer:
                     epoch_rewards.append(metrics['avg_reward'])
                     if self.accelerator is None or self.accelerator.is_main_process:
                         if global_step % self.log_interval == 0:
-                            pbar.set_postfix({'loss': f"{metrics['loss_manager']:.4f}",
-                                              'reward': f"{metrics['avg_reward']:.3f}"})
+                            pbar.set_postfix({
+                                'loss': f"{metrics['loss_manager']:.4f}",
+                                'reward': f"{metrics['avg_reward']:.3f}"
+                            })
 
+            # ======================================================
+            # ✅ 每个 epoch 汇总
+            # ======================================================
             if self.accelerator is None or self.accelerator.is_main_process:
                 avg_reward = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
                 avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
                 print(f"\nEpoch {epoch + 1} Summary: Avg Reward={avg_reward:.4f}, Avg Loss={avg_loss:.4f}")
                 if self.wandb:
-                    self.wandb.log({"epoch": epoch + 1, "epoch/avg_reward": avg_reward, "epoch/avg_loss": avg_loss})
+                    self.wandb.log({
+                        "epoch": epoch + 1,
+                        "epoch/avg_reward": avg_reward,
+                        "epoch/avg_loss": avg_loss
+                    })
                 if (epoch + 1) % 2 == 0:
                     self.save_manager(f"./checkpoints_grpo/epoch_{epoch + 1}")
+
+            # 确保各 rank 同步进入下一轮
+            if self.accelerator:
+                self.accelerator.wait_for_everyone()
 
     # ===============================================================
     # 保存模型
