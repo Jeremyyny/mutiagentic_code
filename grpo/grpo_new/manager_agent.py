@@ -1,122 +1,116 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.distributions import Categorical
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import subagents
 
+
 class ManagerAgent(nn.Module):
-    def __init__(self, model_path, specialist_names, num_rewards, freeze_manager_backbone=True, manager_token_max_len=1024):
+    def __init__(
+        self,
+        model_path,
+        specialist_names,
+        num_rewards,
+        freeze_manager_backbone=True,
+        manager_token_max_len=1024,
+    ):
         super().__init__()
         self.specialist_names = specialist_names
         self.num_specialists = len(specialist_names)
         self.manager_token_max_len = manager_token_max_len
-        self.model = AutoModelForCausalLM.from_pretrained(model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        # backbone
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=None,  # accelerate 管
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
-        hidden_size = self.model.config.hidden_size
-        self.policy_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size // 2, self.num_specialists)
-        )
-        for m in self.policy_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                nn.init.constant_(m.bias, 0)
-        self.value_head = nn.Linear(hidden_size, 1)
+        # policy / value heads
+        hidden = self.model.config.hidden_size
+        self.policy_head = nn.Linear(hidden, self.num_specialists)
+        self.value_head = nn.Linear(hidden, 1)
+        nn.init.xavier_uniform_(self.policy_head.weight)
         nn.init.xavier_uniform_(self.value_head.weight)
-        nn.init.constant_(self.value_head.bias, 0)
 
         if freeze_manager_backbone:
             for p in self.model.parameters():
                 p.requires_grad = False
 
+    # ----------------------------------------------------------------------
+    # 🔹 改进 prompt：短、层次化、更易学
+    # ----------------------------------------------------------------------
     def _build_prompt(self, state, history):
-        problem_info = state.get("problem", state.get("question", ""))
-        context_info = state.get("context", "")
-        current_step = len(history)
+        problem = state.get("problem", state.get("question", ""))
+        context = state.get("context", "")
+        step = len(history)
 
-        if history:
-            recent_history = history[-2:]
-            history_text = "\n\nCompleted steps:\n" + "\n".join([
-                f"Step {current_step - len(recent_history) + i + 1}: {h['content'][:100]}..."
-                for i, h in enumerate(recent_history)
-            ])
-        else:
-            history_text = "\n\nNo steps completed yet."
+        recent = history[-2:] if history else []
+        hist_text = ""
+        if recent:
+            for i, h in enumerate(recent):
+                content = h.get("content", "")
+                hist_text += f"Step {step - len(recent) + i + 1}: {content[:160]}...\n"
 
-        if current_step == 0:
-            hint = "\n\nNext: Start with 'problem_understanding'."
-        elif current_step == 1:
-            hint = "\n\nNext: Call 'reasoning' to evaluate evidence briefly."
-        elif current_step == 2:
-            hint = "\n\nNext: Call 'computation' if numbers exist, otherwise skip."
-        else:
-            hint = "\n\nNext: Call 'answering' to produce ONLY one word: yes, no, or maybe."
+        hint = {
+            0: "Start with 'problem_understanding'.",
+            1: "Then move to 'reasoning'.",
+            2: "Use 'computation' if numbers appear, else skip.",
+        }.get(step, "Finally call 'answering' to conclude (yes/no/maybe).")
 
-        prompt = (
-            f"Problem: {problem_info}\n"
-            f"{f'Context: {context_info}' if context_info else ''}{history_text}{hint}\n\n"
-            f"Available specialists: {', '.join(self.specialist_names)}\n\n"
-            "Determine which specialist should act next based on the current progress."
+        return (
+            f"You are the MANAGER of a medical reasoning system.\n"
+            f"Specialists: [problem_understanding, reasoning, computation, answering].\n"
+            f"Task:\nProblem: {problem}\nContext: {context}\n"
+            f"{'Recent steps:\n' + hist_text if hist_text else ''}"
+            f"Next hint: {hint}\n\n"
+            "Choose exactly one specialist for the next step."
         )
 
-        return self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-        )
-
+    # ----------------------------------------------------------------------
     def forward(self, input_ids, attention_mask):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        last_hidden_state = outputs.hidden_states[-1]
-        mask_exp = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        pooled = (last_hidden_state * mask_exp).sum(dim=1) / mask_exp.sum(dim=1).clamp_min(1e-9)
-        logits = self.policy_head(pooled)
-        value = self.value_head(pooled).squeeze(-1)
+        out = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        last = out.hidden_states[-1][:, -1, :]
+        logits = self.policy_head(last)
+        value = self.value_head(last).squeeze(-1)
         return logits, value
 
+    # ----------------------------------------------------------------------
     def act(self, state, history):
         self.eval()
         prompt = self._build_prompt(state, history)
-        device = next(self.parameters()).device
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=self.manager_token_max_len)
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
+        device = next(self.policy_head.parameters()).device
+        inputs = self.tokenizer(
+            prompt, return_tensors="pt", padding=True, truncation=True, max_length=self.manager_token_max_len
+        ).to(device)
+
         with torch.no_grad():
-            logits, value = self.forward(input_ids, attention_mask)
-            temperature = 1.0
-            logits = logits / temperature
-            current_step = len(history)
-            bias = torch.zeros_like(logits)
-            if current_step == 0:
-                bias[0, self.specialist_names.index("problem_understanding")] += 2.0
-            if current_step == 1:
-                bias[0, self.specialist_names.index("reasoning")] += 2.0
-            if current_step == 2:
-                bias[0, self.specialist_names.index("computation")] += 1.5
-            if current_step >= 3:
-                bias[0, self.specialist_names.index("answering")] += 4.0
-            logits = logits + bias
+            logits, value = self.forward(inputs["input_ids"], inputs["attention_mask"])
             probs = torch.softmax(logits, dim=-1)
             dist = Categorical(probs)
             a_idx = dist.sample()
             logp = dist.log_prob(a_idx)
-            chosen = self.specialist_names[a_idx.item()]
-            return {"specialist_id": chosen, "input": "Analyze and process"}, int(a_idx.item()), float(logp.item()), float(value.squeeze(0).item())
 
+        chosen = self.specialist_names[a_idx.item()]
+        return {"specialist_id": chosen, "input": "Continue with next analysis"}, int(a_idx), logp, value.item()
+
+    # ----------------------------------------------------------------------
     def evaluate_batch(self, state_ids, state_mask, action_indices):
         self.train()
         logits, values = self.forward(state_ids, state_mask)
         dist = Categorical(torch.softmax(logits, dim=-1))
-        new_log_probs = dist.log_prob(action_indices)
+        log_probs = dist.log_prob(action_indices)
         entropy = dist.entropy().mean()
-        return new_log_probs, values, entropy
+        return log_probs, values, entropy
 
 
+# ----------------------------------------------------------------------
+# ✅ Specialist wrapper: 纯推理 + prompt 注册机制
+# ----------------------------------------------------------------------
 class FixedSpecialistAgent(nn.Module):
     def __init__(self, agent_name, model_backend):
         super().__init__()
@@ -125,12 +119,14 @@ class FixedSpecialistAgent(nn.Module):
 
     def generate(self, state, history):
         self.eval()
-        agent_prompt_fn = subagents.AGENT_PROMPT_FUNCTIONS.get(self.agent_name)
-        if not agent_prompt_fn:
+        fn = subagents.AGENT_PROMPT_FUNCTIONS.get(self.agent_name)
+        if not fn:
             raise ValueError(f"Prompt function for {self.agent_name} not found.")
-        messages = agent_prompt_fn(state, history)
-        prompt_text = self.model_backend.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        messages = fn(state, history)
+        prompt_text = self.model_backend.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         max_new = 10 if self.agent_name == "answering" else self.model_backend.max_tokens
         with torch.no_grad():
-            output_text, output_ids, log_probs = self.model_backend.generate_with_logprobs(prompt_text, max_new_tokens=max_new)
-        return output_text, output_ids, log_probs
+            text, ids, logp = self.model_backend.generate_with_logprobs(prompt_text, max_new_tokens=max_new)
+        return text, ids, logp

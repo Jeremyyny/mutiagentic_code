@@ -1,60 +1,68 @@
-import re
+import numpy as np
 
-def extract_answer_pubmedqa(last_value: str) -> str:
-    if not last_value or not isinstance(last_value, str):
-        return ""
-    text = last_value.strip()
-    if text.startswith("[") and "]:" in text:
-        text = text.split("]:", 1)[1].strip()
-    if "\n" in text:
-        text = text.split("\n")[0].strip()
-    text_clean = re.sub(r"[.,!?;:'\"]", "", text.lower()).strip()
-    words = text_clean.split()
-    if words:
-        first = words[0]
-        if first in {"yes", "no", "maybe"}:
-            return first
-    for w in words[:3]:
-        if w in {"yes", "no", "maybe"}:
-            return w
-    for tok in ("yes", "no", "maybe"):
-        m = re.search(rf"\b{tok}\b", text_clean)
-        if m:
-            return tok
-    return ""
+# 可按需开关
+DEBUG_REWARD = False
 
+def _clip01(x):
+    return float(max(0.0, min(1.0, x)))
 
-def calculate_correctness_reward(final_output_text: str, ground_truth: str) -> float:
-    pred = extract_answer_pubmedqa(final_output_text)
-    return 2.0 if pred == ground_truth.lower() else 0.0
+def get_reward_vector(final_trajectory, ground_truth, max_steps):
+    """
+    返回 dict：{"correctness": [0,1], "efficiency": [0,1], "quality": [0,1]}
+    所有分量已统一到 [0,1]，减少量纲不一致带来的震荡。
+    """
+    # correctness：完全匹配或松匹配
+    answer_text = ""
+    for sid, content in final_trajectory:
+        if sid == "answering":
+            answer_text = content
+            break
+    corr = 1.0 if _exact_hit(answer_text, ground_truth) else _fuzzy_hit(answer_text, ground_truth)
+    correctness = _clip01(corr)
 
+    # efficiency：步数越少越好
+    steps = len(final_trajectory)
+    efficiency = _clip01(1.0 - (steps - 1) / max(1, max_steps - 1))
 
-def calculate_efficiency_reward(num_steps: int, max_steps: int) -> float:
-    return -0.2 * (num_steps / max_steps)
+    # quality：简单基于长度与标点结构的启发式分数，可按需替换为更复杂的打分器
+    q = _quality_heuristic(answer_text)
+    quality = _clip01(q)
 
-
-def calculate_quality_reward(agent_name: str, agent_output: str) -> float:
-    s = 0.0
-    low = agent_output.lower()
-    if agent_name == "problem_understanding" and any(k in low for k in ["condition", "population", "endpoint", "answer type", "yes/no/maybe"]):
-        s += 0.2
-    if agent_name == "reasoning" and ("stance:" in low or "evidence" in low or "supports" in low):
-        s += 0.3
-    if agent_name == "computation" and ("summary:" in low or any(k in low for k in ["sensitivity", "specificity", "%", "ci", "rr", "n="])):
-        s += 0.2
-    if agent_name == "answering" and extract_answer_pubmedqa(agent_output) != "":
-        s += 0.5
-    if len(agent_output) > 600:
-        s -= 0.1
-    return s
+    out = {"correctness": correctness, "efficiency": efficiency, "quality": quality}
+    if DEBUG_REWARD:
+        print("REWARD:", out)
+    return out
 
 
-def get_reward_vector(trajectory: list, ground_truth: str, max_steps: int) -> dict:
-    if not trajectory:
-        return {"correctness": 0.0, "efficiency": -0.2, "quality": 0.0}
-    final_agent, final_output = trajectory[-1]
-    num_steps = len(trajectory)
-    r_correctness = calculate_correctness_reward(final_output, ground_truth) if final_agent == "answering" else 0.0
-    r_efficiency = calculate_efficiency_reward(num_steps, max_steps)
-    r_quality = sum(calculate_quality_reward(name, out) for name, out in trajectory) / max(num_steps, 1)
-    return {"correctness": r_correctness, "efficiency": r_efficiency, "quality": r_quality}
+def _exact_hit(ans, gt):
+    a = _clean(ans); g = _clean(gt)
+    return a == g and len(a) > 0
+
+def _fuzzy_hit(ans, gt):
+    a = _clean(ans); g = _clean(gt)
+    if not a or not g:
+        return 0.0
+    # Jaccard 相似度（词级）
+    aset, gset = set(a.split()), set(g.split())
+    inter = len(aset & gset)
+    union = len(aset | gset)
+    return inter / union if union else 0.0
+
+def _quality_heuristic(text):
+    if not text:
+        return 0.0
+    t = _clean(text)
+    n = len(t.split())
+    # 20~80 词最优，超出或不足按线性降
+    if n < 10:
+        base = n / 10.0
+    elif n <= 120:
+        base = 1.0
+    else:
+        base = max(0.0, 1.0 - (n - 120) / 120.0)
+    # 含结论性词汇给一点奖励
+    bonus = 0.1 if any(k in t for k in ["therefore", "thus", "in conclusion", "综上", "因此"]) else 0.0
+    return min(1.0, base + bonus)
+
+def _clean(s):
+    return " ".join(str(s).strip().lower().replace("\n", " ").split())
