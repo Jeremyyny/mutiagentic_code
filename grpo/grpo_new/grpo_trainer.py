@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 import numpy as np
 import reward
+import torch.distributed as dist
 
 
 class GRPOTrainer:
@@ -13,33 +14,33 @@ class GRPOTrainer:
         self.config = config
         self.accelerator = accelerator
 
-        # ---- 保存对象 ----
-        self.manager = manager                  # ManagerAgent（含冻结 backbone + 可训练 heads）
-        self.specialists = specialists          # dict[str, FixedSpecialistAgent]
-        self.model_backend = model_backend      # specialists 的底层模型（只推理）
+        # ---- 核心对象 ----
+        self.manager = manager
+        self.specialists = specialists
+        self.model_backend = model_backend
         self.train_dataset = train_dataset
 
         # ---- 只训练 heads ----
         head_params = list(self.manager.policy_head.parameters()) + list(self.manager.value_head.parameters())
         self.manager_optimizer = Adam(head_params, lr=config['manager_lr'])
 
-        # ---- 只对 heads + optimizer 做 DDP，同步梯度 ----
+        # ---- accelerate prepare（仅 heads + optimizer）----
         if self.accelerator:
             self.manager.policy_head = self.accelerator.prepare(self.manager.policy_head)
-            self.manager.value_head  = self.accelerator.prepare(self.manager.value_head)
-            self.manager_optimizer   = self.accelerator.prepare(self.manager_optimizer)
+            self.manager.value_head = self.accelerator.prepare(self.manager.value_head)
+            self.manager_optimizer = self.accelerator.prepare(self.manager_optimizer)
 
-        # ---- 冻结的 backbone 与 specialist：仅放到设备，不做 DDP ----
-        target_device = self.accelerator.device if self.accelerator else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ---- 冻结 backbone ----
+        device = self.accelerator.device if self.accelerator else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if hasattr(self.manager, "model"):
-            self.manager.model.to(target_device)
+            self.manager.model.to(device)
             self.manager.model.eval()
             for p in self.manager.model.parameters():
                 p.requires_grad = False
 
         if hasattr(self.model_backend, "model"):
-            self.model_backend.model.to(target_device)
+            self.model_backend.model.to(device)
             self.model_backend.model.eval()
             for p in self.model_backend.model.parameters():
                 p.requires_grad = False
@@ -57,11 +58,9 @@ class GRPOTrainer:
         self.grpo_epochs = int(config.get('grpo_epochs', 3))
         self.minibatch_size = int(config.get('minibatch_size', 8))
         self.manager_token_max_len = int(config.get('manager_token_max_len', 1024))
-
-        # ---- 记录参数 ----
         self.log_interval = int(config.get('log_interval', 5))
 
-        # ---- WandB（仅主进程）----
+        # ---- wandb 初始化 ----
         self.use_wandb = bool(config.get("use_wandb", False))
         self.wandb = None
         if self.use_wandb and (self.accelerator is None or self.accelerator.is_main_process):
@@ -74,7 +73,8 @@ class GRPOTrainer:
                 config=config,
                 reinit=True,
             )
-            wandb.define_metric("step"); wandb.define_metric("epoch")
+            wandb.define_metric("step")
+            wandb.define_metric("epoch")
             for k in ["loss_manager", "avg_reward", "reward_std", "policy_loss", "value_loss", "entropy"]:
                 wandb.define_metric(k, step_metric="step")
             wandb.define_metric("epoch/avg_reward", step_metric="epoch")
@@ -88,9 +88,9 @@ class GRPOTrainer:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages
 
-    # ---------------------------- Collect (rollout only on rank0) ----------------------------
+    # ---------------------------- Rollout（仅 rank0） ----------------------------
     def collect_trajectory_group(self, sample):
-        """仅 rank0 调用；根据 config['verbose_trajectory'] 记录到 W&B"""
+        """仅 rank0 rollout"""
         state = {"problem": sample["problem"], "context": sample.get("context", "")}
         ground_truth = sample["answer"]
         group_trajectories = []
@@ -107,7 +107,6 @@ class GRPOTrainer:
                     current_state = {**state, "instruction": act["input"]}
                     output_text, _, _ = specialist.generate(current_state, history)
 
-                    # 记录一步
                     episode_steps.append({
                         "state_prompt": self.manager._build_prompt(state, history),
                         "manager_action_index": int(action_index),
@@ -116,27 +115,19 @@ class GRPOTrainer:
                     })
                     history.append({"role": "assistant", "content": f"[{sid}]: {output_text}"})
 
-                    # W&B 轨迹（仅 rank0）
+                    # 可选 wandb log
                     if self.wandb and self.config.get("verbose_trajectory", False):
                         self.wandb.log({
-                            "trajectory/sample_problem": state["problem"][:120],
                             "trajectory/step": step,
                             "trajectory/specialist": sid,
-                            "trajectory/manager_logp": float(action_log_prob),
-                            "trajectory/output_snippet": output_text[:100],
+                            "trajectory/logp": float(action_log_prob),
+                            "trajectory/output": output_text[:100],
                         })
 
                     if sid == "answering" or step == self.config['max_steps'] - 1:
-                        # 尾部再补一条汇总（仅 rank0）
-                        if self.wandb and self.config.get("verbose_trajectory", False):
-                            self.wandb.log({
-                                "trajectory/final_specialist": sid,
-                                "trajectory/length": step + 1,
-                                "trajectory/final_answer": output_text[:80],
-                            })
                         break
                 except Exception as e:
-                    tqdm.write(f"❌ Error in step {step}: {e}")
+                    tqdm.write(f"❌ rollout error: {e}")
                     break
 
             if episode_steps:
@@ -148,7 +139,7 @@ class GRPOTrainer:
 
         return group_trajectories
 
-    # ---------------------------- Update (all ranks) ----------------------------
+    # ---------------------------- GRPO update ----------------------------
     def update_manager_grpo(self, group_trajectories, global_step):
         if not group_trajectories:
             return {}
@@ -158,7 +149,6 @@ class GRPOTrainer:
                                      dtype=torch.float32, device=model_device)
         group_adv = self._compute_group_advantages(group_rewards)
 
-        # 扁平化所有 step
         all_steps = []
         for i, traj in enumerate(group_trajectories):
             for st in traj['steps']:
@@ -166,8 +156,6 @@ class GRPOTrainer:
                 rec['scalar_reward'] = float(group_rewards[i].item())
                 rec['group_advantage'] = float(group_adv[i].item())
                 all_steps.append(rec)
-        if not all_steps:
-            return {}
 
         total_loss = total_policy = total_value = total_entropy = 0.0
         num_updates = 0
@@ -178,18 +166,18 @@ class GRPOTrainer:
             for s in range(0, n, self.minibatch_size):
                 mb = [all_steps[i] for i in idx[s:s + self.minibatch_size]]
 
-                prompts = [x['state_prompt'] for x in mb]
-                toks = self.manager.tokenizer(prompts, return_tensors="pt",
-                                              padding=True, truncation=True,
-                                              max_length=self.manager_token_max_len)
-                state_ids = toks['input_ids'].to(model_device, non_blocking=True)
-                state_mask = toks['attention_mask'].to(model_device, non_blocking=True)
-                act_idx = torch.tensor([x['manager_action_index'] for x in mb],
-                                       dtype=torch.long, device=model_device)
-                scalar_rewards = torch.tensor([x['scalar_reward'] for x in mb],
-                                              dtype=torch.float32, device=model_device)
-                grp_adv = torch.tensor([x['group_advantage'] for x in mb],
-                                       dtype=torch.float32, device=model_device)
+                toks = self.manager.tokenizer(
+                    [x['state_prompt'] for x in mb],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.manager_token_max_len
+                )
+                state_ids = toks['input_ids'].to(model_device)
+                state_mask = toks['attention_mask'].to(model_device)
+                act_idx = torch.tensor([x['manager_action_index'] for x in mb], dtype=torch.long, device=model_device)
+                scalar_rewards = torch.tensor([x['scalar_reward'] for x in mb], dtype=torch.float32, device=model_device)
+                grp_adv = torch.tensor([x['group_advantage'] for x in mb], dtype=torch.float32, device=model_device)
 
                 new_logp, new_values, entropy = self.manager.evaluate_batch(state_ids, state_mask, act_idx)
 
@@ -206,7 +194,6 @@ class GRPOTrainer:
 
                 self.manager_optimizer.zero_grad(set_to_none=True)
                 if self.accelerator:
-                    # 所有 rank 都在该处 backward（因为大家拿到同一份 gtraj）
                     self.accelerator.backward(loss)
                     self.accelerator.clip_grad_norm_(
                         list(self.manager.policy_head.parameters()) + list(self.manager.value_head.parameters()),
@@ -240,9 +227,8 @@ class GRPOTrainer:
 
         return metrics
 
-    # ---------------------------- Train (rank0 rollout + sync update) ----------------------------
+    # ---------------------------- Training loop ----------------------------
     def train(self):
-        # 分布式采样器；其它 rank 也要推进 dataloader 光标（但不 roll out）
         if self.accelerator and self.accelerator.state.num_processes > 1:
             sampler = DistributedSampler(self.train_dataset, shuffle=True, drop_last=True)
             dataloader = DataLoader(self.train_dataset, batch_size=1, sampler=sampler,
@@ -264,28 +250,28 @@ class GRPOTrainer:
                         disable=not (self.accelerator is None or self.accelerator.is_main_process))
 
             for batch in pbar:
-                # ---- 仅 rank0 rollout ----
+                # ---- rank0 rollout ----
                 if self.accelerator is None or self.accelerator.is_main_process:
                     sample = {k: batch[k][0] for k in batch}
                     gtraj = self.collect_trajectory_group(sample)
                 else:
                     gtraj = []
 
-                # ---- 广播 trajectory 到所有 rank ----
-                if self.accelerator and self.accelerator.num_processes > 1:
-                    gathered = self.accelerator.gather_object(gtraj)
+                # ---- 用 torch.distributed.all_gather_object 同步轨迹 ----
+                if self.accelerator and self.accelerator.num_processes > 1 and dist.is_initialized():
+                    world_size = self.accelerator.num_processes
+                    obj_list = [None for _ in range(world_size)]
+                    dist.all_gather_object(obj_list, gtraj)
                     gtraj = []
-                    for gt in gathered:
+                    for gt in obj_list:
                         if isinstance(gt, list):
                             gtraj.extend(gt)
 
                 if not gtraj:
-                    # 理论上不会发生（rank0 必定生成），但留守护
                     if self.accelerator:
                         self.accelerator.wait_for_everyone()
                     continue
 
-                # ---- 全卡同步更新 ----
                 metrics = self.update_manager_grpo(gtraj, global_step)
                 global_step += 1
 
@@ -299,13 +285,16 @@ class GRPOTrainer:
                                 'reward': f"{metrics['avg_reward']:.3f}"
                             })
 
-            # ---- epoch 汇总（仅 rank0）----
             if self.accelerator is None or self.accelerator.is_main_process:
                 avg_reward = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
                 avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
                 print(f"\nEpoch {epoch+1} Summary: Avg Reward={avg_reward:.4f}, Avg Loss={avg_loss:.4f}")
                 if self.wandb:
-                    self.wandb.log({"epoch": epoch + 1, "epoch/avg_reward": avg_reward, "epoch/avg_loss": avg_loss})
+                    self.wandb.log({
+                        "epoch": epoch + 1,
+                        "epoch/avg_reward": avg_reward,
+                        "epoch/avg_loss": avg_loss
+                    })
                 if (epoch + 1) % 2 == 0:
                     self.save_manager(f"./checkpoints_grpo/epoch_{epoch+1}")
 
