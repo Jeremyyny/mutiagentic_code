@@ -28,7 +28,9 @@ class GRPOTrainer:
 
         # Prepare for distributed training
         if self.accelerator:
-            self.manager, self.manager_optimizer = self.accelerator.prepare(self.manager, self.manager_optimizer)
+            self.manager_optimizer = self.accelerator.prepare(self.manager_optimizer)
+            if hasattr(self.manager, "model"):
+                self.manager.model = self.accelerator.prepare(self.manager.model)
 
         # GRPO parameters
         self.num_samples_per_prompt = config.get('num_samples_per_prompt', 4)
